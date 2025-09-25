@@ -1,12 +1,92 @@
 import pygame
 import random
 import sys
+import pyttsx3
+import tempfile
+import os
+import numpy as np
+import pygame.sndarray
+
+from ui_text import text_surface as text_surface_with_font, SpeechBubble, FadingText, ScoreCounter, draw_end_message, WHITE, BLACK
+from BottomPanel import BottomPanel
+from HealthBar import HealthBar
 
 # potential api i could use for this
 # https://www.wordsapi.com/
 
 # start pygame
 pygame.init()
+
+# setup pygame mixer
+pygame.mixer.init()
+
+def apply_pitch_and_speed(sound: pygame.mixer.Sound, pitch_shift=0.0, speed_change=1.0):
+    arr = pygame.sndarray.array(sound).astype(np.float32)
+
+    # Resample for speed + pitch
+    factor = speed_change * (2 ** (pitch_shift / 12.0))
+    old_len = arr.shape[0] # Unresolved attribute reference 'shape' for class 'ndarray' ??
+    new_len = int(old_len / factor)
+
+    # Avoid crash if invalid size
+    if new_len < 1:
+        return sound
+
+    # Resample using numpy interpolation
+    idxs = np.linspace(0, old_len - 1, new_len)
+    resampled = np.zeros((new_len, arr.shape[1]), dtype=np.float32)
+    for ch in range(arr.shape[1]):
+        resampled[:, ch] = np.interp(idxs, np.arange(old_len), arr[:, ch])
+
+    resampled = np.clip(resampled, -32768, 32767).astype(np.int16)  # Unresolved attribute reference 'astype' for class 'ndarray' ????? I think PyCharm is just kinda dumb
+
+    return pygame.mixer.Sound(resampled)
+
+def play_music_random_start(path, loop=-1, volume=0.5):
+    pygame.mixer.music.stop()
+    pygame.mixer.music.load(path)
+    pygame.mixer.music.set_volume(volume)
+
+    # length in seconds (works for most formats)
+    length = pygame.mixer.Sound(path).get_length()
+
+    # pick random start point (leave 10s margin so it doesn't end instantly)
+    start_time = random.uniform(0, max(0, round(length - 10)))
+
+    # play from that offset
+    pygame.mixer.music.play(loop, start=start_time)
+
+
+def _tts_generate(word: str):
+    engine = pyttsx3.init()
+
+    base_rate = 175
+    rate_variation = random.randint(-30, 30)
+
+    engine.setProperty("voice", engine.getProperty("voices")[1].id)
+    engine.setProperty("rate", base_rate + rate_variation)
+    engine.setProperty("volume", 1.0)
+    fd, path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+
+    engine.save_to_file(word, path)
+    engine.runAndWait()
+    engine.stop()
+
+    return path
+
+
+def speak_word(word):
+    path = _tts_generate(word)
+    base_sound = pygame.mixer.Sound(path)
+
+    # Random pitch between -2 and +2 semitones
+    pitch = random.uniform(-2, 4)
+    # Random speed between 0.9x and 1.1x
+    speed = random.uniform(0.9, 1.1)
+
+    sound = apply_pitch_and_speed(base_sound, pitch_shift=pitch, speed_change=speed)
+    sound.play()
 
 # window
 # on my last version I HAD THE WIDTH AND HEIGHT BACKWARDS ;w;
@@ -15,14 +95,17 @@ SCREEN_HEIGHT = 600
 screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
 
 # lazy solution
-def run_once(f):
-    def wrapper(*args, **kwargs):
-        if not wrapper.has_run:
-            wrapper.has_run = True
-            return f(*args, **kwargs)
-    wrapper.has_run = False
+def run_once_per_text(f):
+    printed_texts = set()
+    def wrapper(text: str, *args, **kwargs):
+        if text not in printed_texts:
+            printed_texts.add(text)
+            return f(text, *args, **kwargs)
+    def _reset():
+        printed_texts.clear()
+    wrapper.reset = _reset
     return wrapper
-@run_once
+@run_once_per_text
 def print_once(text:str):
     print(text)
 
@@ -74,7 +157,13 @@ def generate_word():
 
     # check if it doesn't exist
     while True:
-        word = random.choice(prefixes) + random.choice(roots) + random.choice(suffixes)
+        easter_egg = random.randint(1,100000)
+        if easter_egg == 13:
+            word = 'koji'
+        elif easter_egg == 80:
+            word = 'lainwire'
+        else:
+            word = random.choice(prefixes) + random.choice(roots) + random.choice(suffixes)
         if not words.exists(word):
             if DEBUG:
                 print("BASE: Picking random fake word!")  # DEBUG print
@@ -106,6 +195,9 @@ SCALE = 1.5
 START_EMOTE = 0
 GAME_OVER = False
 DEFAULT_FONT = pygame.font.SysFont(None, 32)
+BIG_FONT = pygame.font.SysFont(None, 48)
+BIGGER_FONT = pygame.font.SysFont(None, 72)
+SMALL_FONT = pygame.font.SysFont(None, 24)
 
 # easy to toggle debug setting
 DEBUG = False
@@ -138,6 +230,7 @@ friendNeutral = pygame.image.load('./resources/friend_neutral.png').convert_alph
 friendTalk = pygame.image.load('./resources/friend_talk.png').convert_alpha()
 friendHappy = pygame.image.load('./resources/friend_happy.png').convert_alpha()
 friendSad = pygame.image.load('./resources/friend_sad.png').convert_alpha()
+finger_img = pygame.image.load("./resources/finger.png").convert_alpha()
 
 # resize the images with the SCALE global variable
 friendNeutral = pygame.transform.scale(friendNeutral,
@@ -147,239 +240,141 @@ friendHappy = pygame.transform.scale(friendHappy,
                                      (friendHappy.get_size()[0] * SCALE, friendHappy.get_size()[1] * SCALE))
 friendSad = pygame.transform.scale(friendSad, (friendSad.get_size()[0] * SCALE, friendSad.get_size()[1] * SCALE))
 
-# function to create text surfaces (to simplify the code for the text classes)
-def text_surface_with_font(font: pygame.font.Font, text: str, color, bold=False):
-    font.set_bold(bold)
-    return font.render(text, True, color).convert_alpha()
-
-# TODO a lot of these text classes/functions are kind of messy, I could make some generic text stuff to save space
-# (but would it save space..?)
-
-# function for a gameover message
-def draw_end_message(surface, message, color=(255, 0, 0), font_size=72, pos=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)):
-    font = pygame.font.SysFont(None, font_size, bold=True)
-    text = text_surface_with_font(font, message, color, bold=True)
-    rect = text.get_rect(center=pos)
-    surface.blit(text, rect)
-
-# class for the health bar, also handles the health numbers
-# just a placeholder for now
-# is it better to have the health in here, or as a global number..?
-class HealthBar(pygame.sprite.Sprite):
-    def __init__(self, x, y, group, width=200, height=25, max_health=100, color=(0, 255, 0)):
-        super().__init__()
-        self.max_health = max_health
-        self.current_health = max_health
-        self.width = width
-        self.height = height
-        self.color = color
-        self.x = x
-        self.y = y
-
-        self.image = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
-        self.rect = self.image.get_rect(topleft=(x, y))
-        self.update_image()
-        super().__init__(group)
-
-    # for when we want to reduce the player's health
-    def take_damage(self, amount):
-        self.current_health = max(0, self.current_health - amount)
-        self.update_image()
-
-    # for if the player heals some health (unused for now)
-    def heal(self, amount):
-        self.current_health = min(self.max_health, self.current_health + amount)
-        self.update_image()
-
-    def update_image(self):
-        self.image.fill((0, 0, 0, 0))  # clear
-        ratio = self.current_health / self.max_health
-        pygame.draw.rect(self.image, (255, 0, 0), (0, 0, self.width, self.height))  # red background
-        pygame.draw.rect(self.image, self.color, (0, 0, self.width * ratio, self.height))  # green foreground
-        pygame.draw.rect(self.image, (255, 255, 255), (0, 0, self.width, self.height), 2)  # border
-
-    # for potential effects if I make any
-    def update(self):
-        pass
-
-# class to make text appear in a bubble
-class SpeechBubble:
-    def __init__(self, text, text_color, background, pos, friend_pos, bold=False, padding=20, radius=15,
-                 tail_length=25, tail_width=30):
-        # make text
-        text_surf = text_surface_with_font(DEFAULT_FONT, text, text_color, bold)
-        text_rect = text_surf.get_rect()
-
-        # bubble size
-        w, h = text_rect.width + padding, text_rect.height + padding
-        self.image = pygame.Surface((w, h + tail_length), pygame.SRCALPHA)
-
-        # draw rounded rectangle for bubble body
-        pygame.draw.rect(self.image, background, (0, 0, w, h), border_radius=radius)
-
-        # center text on bubble
-        tr = text_surf.get_rect(center=(w // 2, h // 2))
-        self.image.blit(text_surf, tr)
-
-        # bubble rect on screen
-        self.rect = self.image.get_rect(center=pos)
-
-        # I could NOT figure out how to make the tail triangular perfectly
-        # draw tail
-        fx, fy = friend_pos
-
-        # bubble bottom center (in local coords)
-        cx = w // 2
-        base_y = h
-
-        # tail base points (a small horizontal line at bubble’s bottom)
-        half_base = tail_width // 3
-        left_base = (cx - half_base - 5, base_y)
-        right_base = (cx + half_base, base_y)
-
-        # tail tip: friend position relative to bubble surface
-        tip_x = fx - self.rect.left
-        tip_y = fy - self.rect.top
-
-        # make sure tip is BELOW bubble bottom
-        if tip_y < base_y + 5:
-            tip_y = base_y + 5
-
-        # draw triangle tail
-        pygame.draw.polygon(self.image, background, [left_base, right_base, (tip_x + 30, tip_y - 40)])
-
-    def draw(self, surface):
-        surface.blit(self.image, self.rect)
-
-# class for the score counter, also handles the score
-# same question here as the health, should it be separate..?
-class ScoreCounter(pygame.sprite.Sprite):
-    # need to pull the global here
-    global HIGHSCORE
-
-    # the parameter HIGH is for whether it's the high score counter instead
-    def __init__(self, x, y, group, font_size=36, color=(255, 255, 255), text="Score: ", high=False):
-        # I don't really know why I put super init here
-        # I'm scared to change it though I'll leave it here
-        super().__init__()
-        self.font = pygame.font.SysFont(None, font_size)
-        self.color = color
-        self.high = high
-        # different behavior if it's the regular score counter,
-        # or the high score counter
-        if self.high:
-            self.score = HIGHSCORE
-        else:
-            self.score = 0
-
-        # initial render
-        self.image = text_surface_with_font(self.font, text + str(self.score), self.color)
-        self.rect = self.image.get_rect(midtop=(x, y))
-        super().__init__(group)
-
-    # add score
-    def add_score(self, points=1):
-        global HIGHSCORE
-        if not self.high:
-            self.score += points
-            # if the score beats the high score, update it
-            if self.score > HIGHSCORE:
-                file2 = open("./resources/highscore.txt", "w")
-                file2.write(str(self.score))
-                file2.close()
-                HIGHSCORE = self.score
-            self.update_image()
-
-    # reset the score (unused)
-    def reset(self):
-        if not self.high:
-            self.score = 0
-            self.update_image()
-
-    def update_image(self):
-        global HIGHSCORE
-        if self.high:
-            self.score = HIGHSCORE
-            self.image = text_surface_with_font(self.font, f"High Score: {HIGHSCORE}", self.color)
-        else:
-            self.image = text_surface_with_font(self.font, f"Score: {self.score}", self.color)
-        self.rect = self.image.get_rect(midtop=self.rect.midtop)
-
-    # potentially for effects
-    def update(self):
-        pass
-
-# class to make text appear, that fades out after
-class FadingText:
-    # lifetime is in milliseconds
-    def __init__(self, text, color, pos, bold=False, lifetime=2000):
-        self.image = text_surface_with_font(DEFAULT_FONT, text, color, bold)
-        self.rect = self.image.get_rect(center=pos)
-        self.start_time = pygame.time.get_ticks()
-        self.lifetime = lifetime
-        self.alpha = 255
-        self.alive = True
-
-    def update(self):
-        # how long since it started
-        elapsed = pygame.time.get_ticks() - self.start_time
-        if elapsed > self.lifetime:
-            self.alive = False
-        else:
-            # fade alpha based on progress
-            progress = elapsed / self.lifetime
-            self.alpha = 255 * (1 - progress)
-        # it was complaining about having a float here
-        # so I rounded it...
-        self.image.set_alpha(round(self.alpha))
-
-    def draw(self, surface):
-        # don't draw it if it finished fading out
-        if self.alive:
-            surface.blit(self.image, self.rect)
+finger_img = pygame.transform.scale(finger_img,
+                                       (finger_img.get_size()[0] * 2, finger_img.get_size()[1] * 2))
 
 # button sprite class
 class Button(pygame.sprite.Sprite):
-    def __init__(self, x, y, active, text="", font=pygame.font.SysFont(None, 28)):
-        pygame.sprite.Sprite.__init__(self)
+    def __init__(self, x, y, active, text="", font=pygame.font.SysFont(None, 28),
+                 normal_color=(182, 218, 206), hover_color=(140, 166, 157),
+                 inactive_color=(120, 140, 130), border=4, border_color=(0, 0, 0),
+                 radius=8, shadow_strength=120, shadow_height_ratio=0.3, finger=None):
+        super().__init__()
         self.active = active
         self.font = font
         self.text = text
+        self.normal_color = normal_color
+        self.hover_color = hover_color
+        self.inactive_color = inactive_color
+        self.border = border
+        self.border_color = border_color
+        self.radius = radius
+        self.finger = finger
 
-        text_surf = text_surface_with_font(self.font, self.text, (0, 0, 0))
+        # finger animation state
+        self.finger_visible = False
+        self.finger_y = -90  # start offset (appears higher up)
+        self.finger_target_y = -300
+        self.finger_speed = 1200  # px/sec easing speed
+
+        self.shadow_strength = shadow_strength
+        self.shadow_height_ratio = shadow_height_ratio
+
+        text_surf = text_surface_with_font(self.font, self.text, BLACK)
         text_size = text_surf.get_size()
         w, h = text_size[0] * 2, text_size[1] * 2
 
-        self.image = pygame.Surface((w, h))
+        self.image = pygame.Surface((w, h + 15), pygame.SRCALPHA)
         self.rect = self.image.get_rect(center=(x, y))
+
+    def _draw_shadow_gradient(self, target):
+        """Draw a vertical shadow gradient clipped to the button's rounded shape."""
+        w, h = target.get_size()
+        gradient_height = int(h * self.shadow_height_ratio)
+
+        # make the gradient
+        grad = pygame.Surface((w, gradient_height), pygame.SRCALPHA)
+        for y in range(gradient_height):
+            alpha = int(self.shadow_strength * (1 - y / gradient_height))
+            pygame.draw.line(grad, (0, 0, 0, alpha), (0, y), (w, y))
+
+        # create mask surface with rounded rect (fully opaque inside shape)
+        mask = pygame.Surface((w, h), pygame.SRCALPHA)
+        pygame.draw.rect(mask, (255, 255, 255, 255), mask.get_rect(), border_radius=self.radius)
+
+        # blit gradient into a temp surface same size as button
+        temp = pygame.Surface((w, h), pygame.SRCALPHA)
+        temp.blit(grad, (0, 0))
+
+        # apply mask
+        temp.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+
+        # finally draw onto target
+        target.blit(temp, (0, 0))
+
+    def update(self, dt):
+        mouse_pos = pygame.mouse.get_pos()
+        if self.active and self.rect.collidepoint(mouse_pos):
+            if not self.finger_visible:
+                self.finger_visible = True
+                self.finger_y = -360  # reset animation each time
+            # ease finger toward target
+            if self.finger_y < self.finger_target_y:
+                self.finger_y += self.finger_speed * dt
+                if self.finger_y > self.finger_target_y:
+                    self.finger_y = self.finger_target_y
+        else:
+            self.finger_visible = False
 
     def draw(self, screen):
         mouse_pos = pygame.mouse.get_pos()
-        # x, y = self.rect.center
-        # color = (182, 218, 206)
 
-        text_surf = text_surface_with_font(self.font, self.text, (0, 0, 0))
-        text_rect = text_surf.get_rect(center=(self.rect.width // 2, self.rect.height // 2))
-
-        # change colors
+        # choose base color
         if self.active:
-            # get a little darker if the mouse is on it
             if self.rect.collidepoint(mouse_pos):
-                color = (140, 166, 157)
-                self.image.fill(color)
-                self.image.blit(text_surf, text_rect)
-                screen.blit(self.image, self.rect)
+                color = self.hover_color
             else:
-                color = (182, 218, 206)
-                self.image.fill(color)
-                self.image.blit(text_surf, text_rect)
-                screen.blit(self.image, self.rect)
-        # permanently darker while inactive
+                color = self.normal_color
         else:
-            color = (140, 166, 157)
-            self.image.fill(color)
-            self.image.blit(text_surf, text_rect)
-            screen.blit(self.image, self.rect)
+            color = self.inactive_color
+
+        self.image.fill((0, 0, 0, 0))
+
+        # background
+        pygame.draw.rect(self.image, color, self.image.get_rect(),
+                         border_radius=self.radius)
+
+        # shadow gradient (before border, under text)
+        self._draw_shadow_gradient(self.image)
+
+        # border
+        if self.border > 0:
+            pygame.draw.rect(self.image, self.border_color, self.image.get_rect(),
+                             self.border, border_radius=self.radius)
+
+        # text
+        text_surf = text_surface_with_font(self.font, self.text, BLACK)
+        text_rect = text_surf.get_rect(center=(self.rect.width // 2, self.rect.height // 2))
+        self.image.blit(text_surf, text_rect)
+
+        screen.blit(self.image, self.rect)
+
+        # draw finger
+        if self.finger_visible and self.finger:
+            # anchor the finger’s bottom to just above the button
+            fx = self.rect.centerx + 160 - self.finger.get_width() // 2
+            fy = self.rect.top + self.finger_y
+            screen.blit(self.finger, (fx, fy))
+
+
+# simple sprite
+class StaticSprite(pygame.sprite.Sprite):
+    def __init__(self, image_path, pos, *groups):
+        super().__init__(*groups)
+        self.base_image = pygame.image.load(image_path).convert_alpha()
+        self.image = self.base_image
+        self.rect = self.image.get_rect(center=pos)
+        self.visible = True
+
+    def set_visible(self, visible: bool):
+        self.visible = visible
+        self.image = self.base_image if visible else pygame.Surface((0, 0), pygame.SRCALPHA)
+
+    def update(self):
+        # nothing
+        pass
+
+bubblegroup = pygame.sprite.Group()
 
 # friend sprite class
 class Friend(pygame.sprite.Sprite):
@@ -418,8 +413,8 @@ class Friend(pygame.sprite.Sprite):
             talk_choice = generate_word()
             chose_fake_word(talk_choice)
         # say that word in a speech bubble
-        self.bubble = SpeechBubble(talk_choice, (0, 0, 0), (255, 255, 255),
-                                   (SCREEN_WIDTH // 2 - 150, SCREEN_HEIGHT // 2), self.rect.center)
+        self.bubble = SpeechBubble(talk_choice, pos=(SCREEN_WIDTH // 2 - 150, SCREEN_HEIGHT // 2 - 50), friend_pos=self.rect.center)
+        speak_word(talk_choice)
 
     # get happy if the player gets it right
     def answer_correct(self):
@@ -435,8 +430,46 @@ class Friend(pygame.sprite.Sprite):
 
     def draw(self, surface):
         surface.blit(self.image, self.rect)
-        if self.bubble:  # draw bubble if it exists
-            self.bubble.draw(surface)
+        if self.bubble:
+            self.bubble.draw(screen)
+
+class ParallaxBackground(pygame.sprite.Sprite):
+    def __init__(self, screen_rect, image_path, scroll_speed=(20, 20)):
+        super().__init__()
+        self.width, self.height = screen_rect.size
+
+        # Load texture and convert
+        self.texture = pygame.image.load(image_path).convert()
+        self.tex_w, self.tex_h = self.texture.get_size()
+
+        # Offset for scrolling
+        self.offset = [0.0, 0.0]
+        self.scroll_speed = scroll_speed
+
+        # Final surface that fills screen
+        self.image = pygame.Surface((self.width, self.height))
+        self.rect = self.image.get_rect(topleft=(0, 0))
+
+    def set_image(self, image_path):
+        """Swap background image at runtime (menu, game, game over)."""
+        self.texture = pygame.image.load(image_path).convert()
+        self.tex_w, self.tex_h = self.texture.get_size()
+
+    def update(self, dt):
+        # Move offset
+        self.offset[0] = (self.offset[0] + self.scroll_speed[0] * dt) % self.tex_w
+        self.offset[1] = (self.offset[1] + self.scroll_speed[1] * dt) % self.tex_h
+
+        self.image.fill((0, 0, 0))  # clear
+        ox, oy = int(self.offset[0]), int(self.offset[1])
+
+        # Tile texture across screen
+        for x in range(-ox, self.width, self.tex_w):
+            for y in range(-oy, self.height, self.tex_h):
+                self.image.blit(self.texture, (x, y))
+
+screen_rect = screen.get_rect()
+background = ParallaxBackground(screen_rect, "./resources/background.png", scroll_speed=(10, 5))
 
 # game loop
 def game_loop():
@@ -444,10 +477,14 @@ def game_loop():
     print("Hello! Loading..")
     # sprite groups
     friend_group = pygame.sprite.GroupSingle()
+    room_stuff = pygame.sprite.Group()
     ui_group = pygame.sprite.Group()
+    ui_health = pygame.sprite.Group()
+    ui_panel = pygame.sprite.Group()
     ui_ending = pygame.sprite.Group()
-    # log the highscore at the beginning of the round
-    highscore_old = HIGHSCORE
+    bg_group = pygame.sprite.Group()
+    bg_group.add(background)
+
     # game isn't over if it just started!!
     GAME_OVER = False
     # main loop boolean
@@ -455,24 +492,38 @@ def game_loop():
     running = True
     # friend add friend
     friend = Friend(friend_group)
+    StaticSprite('./resources/table.png',(SCREEN_WIDTH // 2 - 250, SCREEN_HEIGHT // 2 + 295),room_stuff)
+
+    # the panel!!
+    panel = BottomPanel(
+        screen.get_rect(),
+        height=80,
+        checker_alpha=30,
+        scroll_speed=(20,20),
+        groups=(ui_panel,)
+    )
+
     # all the fading texts are here
     texts = []
     # define the buttons
-    confirm_button = Button(SCREEN_WIDTH // 2 + 200, SCREEN_HEIGHT // 2 + 200, True, "Yes")
-    deny_button = Button(SCREEN_WIDTH // 2 + 300, SCREEN_HEIGHT // 2 + 200, True, "No")
-    restart_button = Button(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 200, True, "Retry")
+    confirm_button = Button(SCREEN_WIDTH // 2 + 200, SCREEN_HEIGHT // 2 + 200, True, "Real", finger=finger_img)
+    deny_button = Button(SCREEN_WIDTH // 2 + 300, SCREEN_HEIGHT // 2 + 200, True, "Fake", normal_color=(235, 166, 170),hover_color=(184, 137, 139), inactive_color=(184, 137, 139), finger=finger_img)
+    restart_button = Button(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 200, True, "Retry", finger=finger_img)
     # define counters
-    score = ScoreCounter(SCREEN_WIDTH // 2, 10, font_size=40, color=(255, 255, 0), group=ui_group)
-    ScoreCounter(SCREEN_WIDTH // 2, 40, font_size=30, color=(255, 255, 0), text="High Score: ", high=True,
-                 group=ui_group)
-    ScoreCounter(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 100, font_size=30, color=(255, 255, 0),
-                 text="High Score: ", high=True, group=ui_ending)
-    health = HealthBar(20, 20, max_health=3, group=ui_group)
+    score = ScoreCounter(pos=(SCREEN_WIDTH // 2, 10), color=(255, 255, 255), groups=(ui_group,))
+    ScoreCounter(pos=(SCREEN_WIDTH // 2, 50), color=(190, 190, 190), text="High Score: ", high=True,
+                 groups=(ui_group,), font=SMALL_FONT)
+    ScoreCounter(pos=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 100), color=(255, 255, 255),
+                 text="High Score: ", high=True, groups=(ui_ending,),font=BIG_FONT)
+    health = HealthBar(20, 20, max_health=3, fg_pattern='./resources/hearts.png', bg_pattern='./resources/damage.png',group=ui_health)
 
     # friend starts talking right away
     friend.talk()
+    # Play in a loop
+    play_music_random_start("resources/MS.mp3")
 
     while running:
+        dt = clock.tick(60) / 1000.0
         # game over if the health runs out
         if health.current_health <= 0:
             GAME_OVER = True
@@ -481,6 +532,10 @@ def game_loop():
             if event.type == pygame.QUIT:
                 print("Player wants to exit. Closing...")
                 sys.exit()
+            # handle key presses
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_d and DEBUG:
+                    GAME_OVER = True  # DEBUG Force game over
             # handle mouse clicks
             if event.type == pygame.MOUSEBUTTONDOWN:
                 # when we click on Real
@@ -490,10 +545,14 @@ def game_loop():
                         if DEBUG:
                             print("Player pressed CONFIRM and was CORRECT.")  # DEBUG print
                         # show feedback
-                        texts.insert(1, FadingText("Correct!", (29, 222, 83), (500, 300), True))
+                        texts.insert(1, FadingText("Correct!", color=(29, 222, 83), pos=(500, 300)))
                         # stop talking and emote
                         TALKING = False
                         friend.answer_correct()
+                        panel.set_text("Well done!")
+                        panel.set_color(1)
+                        sound = pygame.mixer.Sound('./resources/correct.mp3')
+                        sound.play()
                         START_EMOTE = pygame.time.get_ticks()
                         # add score
                         score.add_score(1)
@@ -504,10 +563,14 @@ def game_loop():
                         if DEBUG:
                             print("Player pressed CONFIRM and was WRONG.")  # DEBUG print
                         # show feedback
-                        texts.insert(1, FadingText("Wrong!", (175, 73, 83), (500, 300), True))
+                        texts.insert(1, FadingText("Wrong!", color=(175, 73, 83), pos=(500, 300)))
                         # stop talking and emote
                         TALKING = False
                         friend.answer_incorrect()
+                        panel.set_color(2)
+                        panel.set_text("That's not right...")
+                        sound = pygame.mixer.Sound('./resources/wrong.mp3')
+                        sound.play()
                         START_EMOTE = pygame.time.get_ticks()
                         # take damage
                         health.take_damage(1)
@@ -517,9 +580,13 @@ def game_loop():
                     if not REAL and TALKING:
                         if DEBUG:
                             print("Player pressed DENY and was CORRECT.")  # DEBUG print
-                        texts.insert(1, FadingText("Correct!", (29, 222, 83), (500, 300), True))
+                        texts.insert(1, FadingText("Correct!", color=(29, 222, 83), pos=(500, 300)))
                         TALKING = False
                         friend.answer_correct()
+                        panel.set_text("Well done!")
+                        panel.set_color(1)
+                        sound = pygame.mixer.Sound('./resources/correct.mp3')
+                        sound.play()
                         START_EMOTE = pygame.time.get_ticks()
                         score.add_score(1)
                         for sprite in ui_ending:
@@ -528,60 +595,74 @@ def game_loop():
                     elif REAL and TALKING:
                         if DEBUG:
                             print("Player pressed DENY and was WRONG.")  # DEBUG print
-                        texts.insert(1, FadingText("Wrong!", (175, 73, 83), (500, 300), True))
+                        texts.insert(1, FadingText("Wrong!", color=(175, 73, 83), pos=(500, 300)))
                         TALKING = False
                         friend.answer_incorrect()
+                        panel.set_text("That's not right...")
+                        panel.set_color(2)
+                        sound = pygame.mixer.Sound('./resources/wrong.mp3')
+                        sound.play()
                         START_EMOTE = pygame.time.get_ticks()
                         health.take_damage(1)
                 # when we click on Retry
                 if restart_button.rect.collidepoint(event.pos):
                     print("Player wants to try again. Restarting..")
-                    # TODO probably shouldn't use recursion
-                    game_loop()
+                    print_once.reset()
+                    return "restart"
 
         # clear the screen each frame
-        screen.fill((0, 0, 0))
+        screen.fill((50,50,50))
+        bg_group.update(dt)
+        bg_group.draw(screen)
 
         # make friend sprite talk
         # draws the option buttons
         if TALKING and not GAME_OVER:
+            pygame.mixer.music.set_volume(0.5)
+            panel.set_text("Is this a real word?")
+            panel.set_color(0)
             MOOD = 1
             confirm_button.draw(screen)
             deny_button.draw(screen)
 
         # stop emoting and give another question
         elapsed = pygame.time.get_ticks() - START_EMOTE
-        if not TALKING and elapsed > 2000 and not GAME_OVER:
+        if not TALKING and elapsed > 1200 and not GAME_OVER:
             friend.talk()
 
         # render stuff
         if GAME_OVER:
-            draw_end_message(screen, "Game Over")
+            pygame.mixer.music.set_volume(0)
+            draw_end_message(screen, "Game Over",pos=(SCREEN_WIDTH // 2, 160))
             print_once("Game ended at score " + str(score.score) + ".")
             restart_button.draw(screen)
             for sprite in ui_ending:
                 sprite.update_image()
             ui_ending.draw(screen)
             # tell user if they got a new high score
-            if HIGHSCORE > highscore_old:
+            if score.score > HIGHSCORE:
                 print_once("Player got a high score!")
                 # TODO fix the position of this one
-                draw_end_message(screen, "New High Score", (197, 224, 37),
-                                 pos=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 300))
+                draw_end_message(screen, "New High Score!",
+                                 pos=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 60), color=(204, 176, 0))
         else:
             # update sprites
+
             friend.update()
             for t in texts:
                 t.update()
                 t.draw(screen)
-                # begone
-                if not t.alive:
-                    texts.remove(t)
-            ui_group.update()
-            ui_group.draw(screen)
-
-            # draw friend stuff
             friend.draw(screen)
+            room_stuff.draw(screen)
+            confirm_button.update(dt)
+            deny_button.update(dt)
+            restart_button.update(dt)
+            ui_group.update()
+            ui_panel.update(dt)
+            ui_health.update(dt)
+            ui_group.draw(screen)
+            ui_panel.draw(screen)
+            ui_health.draw(screen)
 
         # display update
         pygame.display.flip()
@@ -589,5 +670,11 @@ def game_loop():
         # FPS
         clock.tick(60)
 
+    # quit
+    return "quit"
+
 if __name__ == "__main__":
-    game_loop()
+    while True:
+        result = game_loop()
+        if result != "restart":
+            break
